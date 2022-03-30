@@ -45,10 +45,10 @@ class EncoderCounter:
 class Ercf:
 
     LONG_MOVE_THRESHOLD = 70.
-    MACRO_SERVO_UP = "ERCF_SERVO_UP"
-    MACRO_SERVO_DOWN = "ERCF_SERVO_DOWN"
-    MACRO_UNSELECT_TOOL = "ERCF_UNSELECT_TOOL"
-    MACRO_PAUSE = "ERCF_PAUSE"
+    MACRO_SERVO_UP = "_ERCF_SERVO_UP"
+    MACRO_SERVO_DOWN = "_ERCF_SERVO_DOWN"
+    MACRO_UNSELECT_TOOL = "_ERCF_UNSELECT_TOOL"
+    MACRO_PAUSE = "_ERCF_PAUSE"
 
     def __init__(self, config):
         self.config = config
@@ -101,6 +101,9 @@ class Ercf:
         self.gcode.register_command('ERCF_ENDLESSSPOOL_UNLOAD',
                     self.cmd_ERCF_ENDLESSSPOOL_UNLOAD,
                     desc=self.cmd_ERCF_ENDLESSSPOOL_UNLOAD_help)
+        self.gcode.register_command('ERCF_FINALIZE_LOAD',
+                    self.cmd_ERCF_FINALIZE_LOAD,
+                    desc=self.cmd_ERCF_FINALIZE_LOAD_help)
 
     def handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
@@ -157,10 +160,9 @@ class Ercf:
             homing_string = (" STOP_ON_ENDSTOP=%s" % home)
         if not wait:
             wait_string = (" SYNC=0")
-
         command_string = ("MANUAL_STEPPER STEPPER=selector_stepper"
                          " SPEED=%s ACCEL=%s MOVE=%s%s%s"
-                         % (speed, accel, ref_pos, homing_string, wait_string))
+                         % (speed, accel, dist, homing_string, wait_string))
         self.gcode.run_script_from_command(command_string)
 
     cmd_ERCF_CALIBRATE_ENCODER_help = "Calibration routine for the ERCF encoder"
@@ -195,6 +197,13 @@ class Ercf:
         mean_plus = self._sample_stats(plus_values)['mean']
         mean_minus = self._sample_stats(min_values)['mean']
         half_mean = ( float(mean_plus) + float(mean_minus) ) / 4
+
+        if half_mean == 0:
+            gcmd.respond_info("No counts measured. Ensure a tool was selected " +
+                              "before running calibration and that your encoder " +
+                              "is working properly")
+            return
+
         resolution = dist / half_mean
         old_result = half_mean * self.encoder_resolution
         new_result = half_mean * resolution
@@ -286,7 +295,7 @@ class Ercf:
                             %(req_length, counter_distance))
             diff_distance = req_length - counter_distance
             
-            if diff_distance <= 4. or not iterate :
+            if diff_distance <= 6. or not iterate :
                 # Measured move is close enough or no iterations : load succeeds
                 return
 
@@ -298,7 +307,7 @@ class Ercf:
                                         " requested = %.1f, measured = %.1f"
                                         %(req_length, counter_distance))
                 diff_distance = req_length - counter_distance
-                if diff_distance <= 4.:
+                if diff_distance <= 6.:
                     # Measured move is close enough : load succeeds
                     return
                 if diff_distance > self.LONG_MOVE_THRESHOLD:
@@ -314,49 +323,43 @@ class Ercf:
     cmd_ERCF_UNLOAD_help = "Unload filament and park it in the ERCF"
     def cmd_ERCF_UNLOAD(self, gcmd):
         # Define unload move parameters
+        self.toolhead.dwell(0.2)
         iterate = True
         buffer_length = 30.
         homing_move = gcmd.get_int('HOMING', 0, minval=0, maxval=1)
         unknown_state = gcmd.get_int('UNKNOWN', 0, minval=0, maxval=1)
         req_length = gcmd.get_float('LENGTH', 1200.)
         self.toolhead.wait_moves()
-
         # i.e. long move that will be fast and iterated using the encoder
         if req_length > self.LONG_MOVE_THRESHOLD: 
             req_length = req_length - buffer_length
         else:
             iterate = False
-
         if unknown_state :
             iterate = False
             self._counter.reset_counts()
             self._gear_stepper_move_wait(-req_length)
             homing_move = 1
-
         if homing_move :
             iterate = False
             for step in range( int(req_length / 15.) ):
                 self._counter.reset_counts()
                 self._gear_stepper_move_wait(-15.)
                 delta = 15. - self._counter.get_distance()
-
                 # Filament is now out of the encoder
                 if delta >= 3. :
                     self._counter.reset_counts()
                     self._gear_stepper_move_wait(-(23. - delta))
-
                     if self._counter.get_distance() < 5. :
                         return
         else:
             self._counter.reset_counts()
             self._gear_stepper_move_wait(-req_length)
-
         if iterate :
             counter_distance = self._counter.get_distance()
             self.gcode.respond_info(
                         "Unload move done, requested = %.1f, measured = %.1f"
                         % (req_length, counter_distance) )
-            
             delta_length = req_length - counter_distance
             if delta_length >= 3.0:
                 self._gear_stepper_move_wait(-delta_length)
@@ -364,18 +367,24 @@ class Ercf:
                 self.gcode.respond_info("Correction unload move done,"
                                         " requested = %.1f, measured = %.1f"
                                         %(req_length, counter_distance))
-
+                if ( req_length - counter_distance ) >= 15. :
+                    # Unload failed
+                    self.gcode.respond_info(
+                        "Too much slippage detected during the unload,"
+                        " please check the ERCF, calling %s..."
+                        % self.MACRO_PAUSE)
+                    self.gcode.run_script_from_command(self.MACRO_UNSELECT_TOOL)
+                    self.gcode.run_script_from_command(self.MACRO_PAUSE)
+                    return
             # Final move to park position
-            for step in range( int(buffer_length / 15.) + 1 ):
+            for step in range( int(buffer_length / 15.) + 2 ):
                 self._counter.reset_counts()
                 self._gear_stepper_move_wait(-15.)
                 delta = 15. - self._counter.get_distance()
-
                 # Filament is now out of the encoder
                 if delta >= 3. :
                     self._counter.reset_counts()
                     self._gear_stepper_move_wait(-(23. - delta))
-
                     if self._counter.get_distance() < 5. :
                         return
             # Filament stuck in encoder
@@ -390,25 +399,27 @@ class Ercf:
     def cmd_ERCF_SET_STEPS(self, gcmd):
         ratio = gcmd.get_float('RATIO', 1., above=0.)
         new_step_dist = self.ref_step_dist / ratio
-        self.gear_stepper.rail.steppers[0].set_step_dist(new_step_dist)
+        stepper = self.gear_stepper.rail.steppers[0]
+        if hasattr(stepper, "set_rotation_distance"):
+            new_rotation_dist = new_step_dist * stepper.get_rotation_distance()[1]
+            stepper.set_rotation_distance(new_rotation_dist)
+        else:
+            # bw compatibilty for old klipper versions
+            stepper.set_step_dist(new_step_dist)
 
     cmd_ERCF_GET_SELECTOR_POS_help = "Report the selector motor position"
     def cmd_ERCF_GET_SELECTOR_POS(self, gcmd):
         ref_pos = gcmd.get_float('REF', 0.)
         self.selector_stepper.do_set_position(0.)
         init_position = self.selector_stepper.steppers[0].get_mcu_position()
-        
-        #self._selector_stepper_move_wait(-ref_pos, 1, True, 50.)
-        
         self.command_string = (
-                        "MANUAL_STEPPER STEPPER=selector_stepper SPEED=40"
+                        "MANUAL_STEPPER STEPPER=selector_stepper SPEED=50"
                         " MOVE=-" + str(ref_pos) + " STOP_ON_ENDSTOP=1")
         self.gcode.run_script_from_command(self.command_string)
 
         current_position = self.selector_stepper.steppers[0].get_mcu_position()
         traveled_position = abs(current_position - init_position) \
                 * self.selector_stepper.steppers[0].get_step_dist()
-
         self.gcode.respond_info("Selector position = %.1f "
                                 %(traveled_position))
 
@@ -486,6 +497,28 @@ class Ercf:
     cmd_ERCF_ENDLESSSPOOL_UNLOAD_help = "Unload the filament from the toolhead"
     def cmd_ERCF_ENDLESSSPOOL_UNLOAD(self, gcmd):
         self.gcode.respond_info("This is a placeholder")
+
+    cmd_ERCF_FINALIZE_LOAD_help = "Finalize the load of a tool to the nozzle"
+    def cmd_ERCF_FINALIZE_LOAD(self, gcmd):
+        length = gcmd.get_float('LENGTH', 30.0, above=0.)
+        threshold = gcmd.get_float('THRESHOLD', 15.0, above=0.)
+        if length is None :
+            self.gcode.respond_info("LENGTH has to be specified")
+            return
+        self._counter.reset_counts()
+        pos = self.toolhead.get_position()
+        pos[3] += length
+        self.toolhead.manual_move(pos, 20)
+        self.toolhead.wait_moves()
+        final_encoder_pos = self._counter.get_distance()
+        if final_encoder_pos < ( length - threshold) :
+            self.gcode.respond_info(
+                "Filament seems blocked between the extruder and the nozzle,"
+                " calling %s..."
+                % self.MACRO_PAUSE)
+            self.gcode.run_script_from_command(self.MACRO_PAUSE)
+            return
+        self.gcode.respond_info("Filament loaded successfully")
 
 def load_config(config):
     return Ercf(config)
